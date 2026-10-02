@@ -202,7 +202,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix="anyps5-tls-coverage-") as directory:
         work = Path(directory)
 
-        def convert(name, image, error=None, tls_address=0x1240, displacement=0, error_offset=None):
+        def convert(name, image, error=None, tls_address=0x1240, displacement=0, error_offset=None, execute=True):
             source = work / (name + ".elf")
             output = source.with_suffix(".exe")
             source.write_bytes(image)
@@ -223,7 +223,7 @@ def main():
                 load = bytes.fromhex("48 8b 80") + struct.pack("<i", displacement)
                 assert load in pe_bytes_at(pe, stub_address, 64), name
             assert pe_bytes_at(pe, 0x11850, len(TLS_LOAD)) == TLS_LOAD, name
-            if os.name == "nt":
+            if os.name == "nt" and execute:
                 executed = subprocess.run([str(output)], capture_output=True, timeout=30)
                 assert executed.returncode == 42, (name, executed.returncode, executed.stderr)
 
@@ -251,17 +251,23 @@ def main():
             convert(name, image, tls_address=address, displacement=displacement)
         for name, image, error in displacement_bounds_cases():
             convert(name, image, error, error_offset=0x1240)
+        convert("xor", make_image("register", "unwind", body=bytes.fromhex("64 48 33 04 25 28 00 00 00 c3")), execute=False)
+        convert("rbx-load", make_image("register", "unwind", body=bytes.fromhex("64 48 8b 03 c3")), execute=False)
+        convert("rbx-xor", make_image("register", "unwind", body=bytes.fromhex("64 48 33 03 c3")), execute=False)
+        convert("r12-load", make_image("register", "unwind", body=bytes.fromhex("64 49 8b 04 24 c3")), execute=False)
+        convert("r12-xor", make_image("register", "unwind", body=bytes.fromhex("64 49 33 04 24 c3")), execute=False)
+        convert("r14-load", make_image("register", "unwind", body=bytes.fromhex("64 49 8b 06 c3")), execute=False)
+        convert("r14-xor", make_image("register", "unwind", body=bytes.fromhex("64 49 33 06 c3")), execute=False)
+        convert("rax-load", make_image("register", "unwind", body=bytes.fromhex("64 48 8b 00 c3")), execute=False)
         rejected = {
             "rsp-displacement": fs_load(4, 40),
             "dword-load": bytes.fromhex("64 8b 04 25 28 00 00 00"),
-            "register-address": bytes.fromhex("64 48 8b 00"),
             "gs-load": bytes.fromhex("65 48 8b 04 25 28 00 00 00"),
             "rex-b-load": bytes.fromhex("64 49 8b 04 25 28 00 00 00"),
             "rex-x-load": bytes.fromhex("64 4a 8b 04 25 28 00 00 00"),
             "compare": bytes.fromhex("64 48 3b 04 25 28 00 00 00"),
             "subtract": bytes.fromhex("64 48 2b 04 25 28 00 00 00"),
             "add": bytes.fromhex("64 48 03 04 25 28 00 00 00"),
-            "xor": bytes.fromhex("64 48 33 04 25 28 00 00 00"),
         }
         for name, instruction in rejected.items():
             convert(name, make_image("register", "unwind", body=instruction + b"\xc3"),
