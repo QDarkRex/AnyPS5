@@ -14,14 +14,21 @@ namespace Elfpatcher::Windows {
 
 namespace {
 
+enum class TlsAccessKind {
+    LoadValue,
+    StoreImmediate,
+    XorValue,
+};
+
 struct TlsAccess {
     std::uint32_t Rva;
     Domain::FileByteOffset FileOffset;
     std::size_t Length;
-    bool StoreImmediate;
+    TlsAccessKind Kind;
     std::uint32_t Immediate;
     std::uint8_t Register;
     std::uint32_t Displacement;
+    std::uint8_t AddressRegister;
 };
 
 void patchAccess(std::vector<PeSection>& sections, const TlsAccess& access, const std::uint32_t target) {
@@ -80,12 +87,19 @@ PeDirectory WindowsTlsBuilder::Build(const std::vector<std::uint8_t>& source, co
                     if (value == 0x66) hasOperandSizePrefix = true;
                     else if (value != 0x64 && !(prefix + 1 == position && value >= 0x40 && value <= 0x4f)) supportedPrefixes = false;
                 }
-                const auto loadRegister = info.Length - position == 7 ? static_cast<std::uint8_t>(((bytes[position + 1] >> 3) & 7) | ((info.RexPrefix & 4) << 1)) : std::uint8_t{4};
+                const auto loadRegister = info.Length - position >= 2 ? static_cast<std::uint8_t>(((bytes[position + 1] >> 3) & 7) | ((info.RexPrefix & 4) << 1)) : std::uint8_t{4};
                 const bool loadValue = supportedPrefixes && (info.RexPrefix == 0x48 || info.RexPrefix == 0x4c) && loadRegister != 4 && bytes[position] == 0x8b && (bytes[position + 1] & 0xc7) == 0x04 && bytes[position + 2] == 0x25;
+                const bool xorValue = supportedPrefixes && (info.RexPrefix == 0x48 || info.RexPrefix == 0x4c) && loadRegister != 4 && bytes[position] == 0x33 && (bytes[position + 1] & 0xc7) == 0x04 && bytes[position + 2] == 0x25;
+                const auto modrm = info.Length - position >= 2 ? bytes[position + 1] : std::uint8_t{0xff};
+                const auto addressRegister = static_cast<std::uint8_t>((modrm & 7) | ((info.RexPrefix & 1) << 3));
+                const bool directRegisterAddress = supportedPrefixes && (info.RexPrefix & 8) != 0 && loadRegister != 4 && info.Length - position == 2 && (bytes[position] == 0x8b || bytes[position] == 0x33) && (modrm & 0xc7) != 0x04 && (modrm & 0xc7) != 0x05;
+                const bool sibRegisterAddress = supportedPrefixes && (info.RexPrefix & 8) != 0 && loadRegister != 4 && info.Length - position == 3 && (bytes[position] == 0x8b || bytes[position] == 0x33) && (modrm & 0xc7) == 0x04 && (bytes[position + 2] & 7) != 5;
+                const bool registerAddress = directRegisterAddress || sibRegisterAddress;
+                const auto baseRegister = sibRegisterAddress ? static_cast<std::uint8_t>((bytes[position + 2] & 7) | ((info.RexPrefix & 1) << 3)) : addressRegister;
                 const bool storeImmediate = supportedPrefixes && !hasOperandSizePrefix && (info.RexPrefix == 0 || info.RexPrefix == 0x40) && info.Length - position == 11 && bytes[position] == 0xc7 && bytes[position + 1] == 0x04 && bytes[position + 2] == 0x25 && Io::ReadU32(source, header.Offset + offset + position + 3) == 0x28;
-                if (!loadValue && !storeImmediate)
+                if (!loadValue && !xorValue && !registerAddress && !storeImmediate)
                     throw Domain::RelinkerException("Unsupported Windows guest TLS instruction", header.Offset + offset);
-                accesses.push_back({rva, header.Offset + offset, info.Length, storeImmediate, storeImmediate ? Io::ReadU32(source, header.Offset + offset + position + 7) : 0, storeImmediate ? std::uint8_t{0} : loadRegister, storeImmediate ? 0 : Io::ReadU32(source, header.Offset + offset + position + 3)});
+                accesses.push_back({rva, header.Offset + offset, info.Length, storeImmediate ? TlsAccessKind::StoreImmediate : (xorValue || (registerAddress && bytes[position] == 0x33)) ? TlsAccessKind::XorValue : TlsAccessKind::LoadValue, storeImmediate ? Io::ReadU32(source, header.Offset + offset + position + 7) : 0, storeImmediate ? std::uint8_t{0} : loadRegister, storeImmediate || registerAddress ? 0 : Io::ReadU32(source, header.Offset + offset + position + 3), registerAddress ? baseRegister : std::uint8_t{0xff}});
             }
         }
     }
@@ -110,7 +124,7 @@ PeDirectory WindowsTlsBuilder::Build(const std::vector<std::uint8_t>& source, co
     const auto templateOffset = CheckedRva((64 + alignment - 1) & ~(alignment - 1));
     constexpr std::uint32_t threadControlBlockSize = 0x30;
     for (const auto& access : accesses) {
-        if (access.StoreImmediate || access.Displacement == 0) continue;
+        if (access.Kind == TlsAccessKind::StoreImmediate || access.AddressRegister != 0xff || access.Displacement == 0) continue;
         const auto displacement = static_cast<std::int64_t>(std::bit_cast<std::int32_t>(access.Displacement));
         if (displacement < -static_cast<std::int64_t>(blockSize) || displacement + 8 > threadControlBlockSize)
             throw Domain::RelinkerException("Windows guest TLS load displacement " + std::to_string(displacement) + " is outside the thread TLS block", access.FileOffset);
@@ -146,19 +160,28 @@ PeDirectory WindowsTlsBuilder::Build(const std::vector<std::uint8_t>& source, co
         if (target != branchTargets.end() && *target < access.Rva + access.Length)
             throw Domain::RelinkerException("Branch enters a guest TLS instruction", *target);
         patchAccess(sections, access, code.GetRva());
-        const bool preserveAccumulator = access.StoreImmediate || access.Register != 0;
+        const bool preserveAccumulator = access.Kind == TlsAccessKind::StoreImmediate || access.Register != 0;
         const bool preserveCounter = access.Register != 1;
         code.Emit({0x48, 0x8d, 0x64, 0x24, 0x80});
         if (preserveCounter) code.Emit({0x51});
         if (preserveAccumulator) code.Emit({0x50});
+        if (access.Kind == TlsAccessKind::XorValue && access.Register == 0) code.Emit({0x50});
         loadPointer();
-        if (!access.StoreImmediate && access.Displacement != 0) {
+        if (access.AddressRegister != 0xff) {
+            code.Emit({static_cast<std::uint8_t>(0x48 | ((access.AddressRegister >> 3) << 1)), 0x8b, 0x04, static_cast<std::uint8_t>((access.AddressRegister & 7) << 3)});
+        } else if (access.Kind != TlsAccessKind::StoreImmediate && access.Displacement != 0) {
             code.Emit({0x48, 0x8b, 0x80});
             code.U32(access.Displacement);
         }
-        if (access.StoreImmediate) {
+        if (access.Kind == TlsAccessKind::StoreImmediate) {
             code.Emit({0xc7, 0x40, 0x28});
             code.U32(access.Immediate);
+        } else if (access.Kind == TlsAccessKind::XorValue) {
+            if (access.Register == 0) {
+                code.Emit({0x59, 0x48, 0x91, 0x48, 0x33, 0xc1});
+            } else {
+                code.Emit({static_cast<std::uint8_t>(0x48 | ((access.Register >> 3) << 2)), 0x33, static_cast<std::uint8_t>(0xc0 | ((access.Register & 7) << 3))});
+            }
         } else if (access.Register != 0) {
             code.Emit({static_cast<std::uint8_t>(0x48 | (access.Register >> 3)), 0x89, static_cast<std::uint8_t>(0xc0 | (access.Register & 7))});
         }
